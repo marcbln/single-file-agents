@@ -1,0 +1,17 @@
+graph TD
+    A[Start Command_RunNextJob] --> B{Fetch 1 Job Candidate};
+    B --> C{Candidate Found?};
+    C -- No --> D[Log 'No Job Found' & Exit];
+    C -- Yes --> E{Try Claim Job ID};
+    E -- Failed --> F[Log 'Claim Failed (Likely Concurrent)' & Exit];
+    E -- Success --> G[Log 'Job Claimed'];
+    G --> H[Create Process Object for Job Command];
+    H --> I[Execute Process Synchronously (Foreground) via process->run()];
+    I --> J{Process Successful? (Check Exit Code)};
+    J -- Yes --> K[Log Success + StdOut/StdErr];
+    J -- No --> L[Log Failure + StdOut/StdErr];
+    K --> M[Record Job Result (Success) via endJobNowWithExitCodeAndLog];
+    L --> N[Record Job Result (Failure) via endJobNowWithExitCodeAndLog];
+    M --> O[Exit Successfully];
+    N --> O;
+
