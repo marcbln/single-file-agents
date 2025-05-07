@@ -38,6 +38,7 @@ import argparse
 import subprocess
 import json
 import textwrap
+import csv # Added for delimiter detection
 from typing import Tuple, Optional
 
 import time
@@ -68,6 +69,106 @@ API_RETRY_WAIT = 5  # seconds
 TOTAL_INPUT_TOKENS = 0
 TOTAL_OUTPUT_TOKENS = 0
 
+# --- UTF-8 Conversion Function ---
+def ensure_utf8_file(original_file_path: str) -> Tuple[str, Optional[str], bool]:
+    """
+    Ensures the file is UTF-8 encoded. If not, converts it and saves a new .utf8.[ext] file.
+    Returns the path to the file to be processed (either original or the new .utf8 version),
+    the detected original encoding, and a boolean indicating if conversion occurred.
+    """
+    console.log(f"Ensuring UTF-8 encoding for: {original_file_path}")
+    detected_encoding = None
+    was_converted = False
+    path_to_process = original_file_path
+    ENCODING_DETECT_CHUNK_SIZE = 4096  # Max chunk size for encoding detection
+
+    try:
+        # 1. Try to detect encoding by reading a small chunk
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'windows-1252']
+        
+        for enc in encodings_to_try:
+            try:
+                with open(original_file_path, 'rb') as f_test: # Read as binary for chunk test
+                    chunk = f_test.read(ENCODING_DETECT_CHUNK_SIZE)
+                chunk.decode(enc) # Try decoding the chunk
+                detected_encoding = enc
+                console.log(f"Detected encoding for '{original_file_path}' as: {detected_encoding}")
+                break # Found a working encoding
+            except UnicodeDecodeError:
+                # console.log(f"Encoding test failed for {enc} on '{original_file_path}'") # Optional: too verbose
+                continue
+            # FileNotFoundError should be caught by main, but good to have a check here
+            except FileNotFoundError:
+                 console.print(Panel(f"Error: Input file not found at '{original_file_path}' during encoding check.", title="[bold red]File Not Found[/bold red]", expand=False))
+                 return original_file_path, None, False # Indicate error
+        
+        if detected_encoding is None:
+            console.log(f"Could not determine encoding for '{original_file_path}' from common types. Assuming UTF-8 or binary.", style="yellow")
+            return original_file_path, None, False # Proceed with original, might fail later
+
+        # 2. Convert if not UTF-8 or UTF-8-SIG (UTF-8 with BOM)
+        if detected_encoding.lower() not in ['utf-8', 'utf-8-sig']:
+            base, ext = os.path.splitext(original_file_path)
+            new_utf8_file_path = f"{base}.utf8{ext}" # Simple suffixing, e.g. data.csv -> data.utf8.csv
+
+            console.log(f"Converting '{original_file_path}' (from {detected_encoding}) to UTF-8 at '{new_utf8_file_path}'")
+            
+            with open(original_file_path, 'r', encoding=detected_encoding, errors='replace') as f_in, \
+                 open(new_utf8_file_path, 'w', encoding='utf-8') as f_out:
+                # Read and write line by line to handle potentially large files
+                for line in f_in:
+                    f_out.write(line)
+            
+            path_to_process = new_utf8_file_path
+            was_converted = True
+            console.log(f"Conversion successful. Processing will use: '{path_to_process}'")
+        else:
+            console.log(f"File '{original_file_path}' is already {detected_encoding}. No conversion needed.")
+            # path_to_process is already original_file_path
+
+    except FileNotFoundError: # Catch if original_file_path itself is not found at the start
+        console.print(Panel(f"Error: Input file not found at '{original_file_path}'", title="[bold red]File Not Found[/bold red]", expand=False))
+        return original_file_path, None, False # Indicate error
+    except Exception as e:
+        console.log(f"An unexpected error occurred during encoding check/conversion for '{original_file_path}': {e}", style="bold red")
+        return original_file_path, detected_encoding, False # Return original path, but flag that something went wrong
+
+    return path_to_process, detected_encoding, was_converted
+
+# --- Delimiter Detection Function (Simplified) ---
+def detect_delimiter(file_path: str, num_lines_to_sample: int = 5, default_delimiter: str = ',') -> str:
+    """
+    Detects the delimiter of a UTF-8 encoded CSV/TSV file by sniffing a sample of its content.
+    Assumes file_path is already UTF-8 encoded.
+    """
+    console.log(f"Attempting to detect delimiter for UTF-8 file: {file_path}")
+    sample_lines = None
+    try:
+        # File is expected to be UTF-8 now
+        with open(file_path, 'r', newline='', encoding='utf-8') as f: # Always use utf-8
+            sample_lines = "".join([f.readline() for _ in range(num_lines_to_sample)])
+        
+        if not sample_lines:
+            console.log(f"File '{file_path}' is empty or too short to sample. Using default delimiter '{default_delimiter}'.", style="yellow")
+            return default_delimiter
+
+        console.log(f"Sample for sniffing ({num_lines_to_sample} lines) from '{file_path}':\n---\n{sample_lines}\n---", style="blue")
+
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample_lines, delimiters=',;\t|') # Common delimiters
+        detected_delimiter_char = dialect.delimiter
+        console.log(f"Detected delimiter: '{detected_delimiter_char}' (repr: {repr(detected_delimiter_char)}) for '{file_path}'", style="green")
+        return detected_delimiter_char
+        
+    except FileNotFoundError: # Should be less likely now, but good to keep
+        console.log(f"File not found during delimiter detection: '{file_path}'. Using default: '{default_delimiter}'.", style="bold red")
+        return default_delimiter
+    except csv.Error:
+        console.log(f"csv.Sniffer could not automatically detect delimiter for '{file_path}' from the sample. Using default: '{default_delimiter}'.", style="yellow")
+        return default_delimiter
+    except Exception as e:
+        console.log(f"An unexpected error occurred during delimiter detection for '{file_path}': {e}. Using default: '{default_delimiter}'.", style="bold red")
+        return default_delimiter
 
 # --- LLM Prompt Template ---
 XSV_COMMAND_GENERATION_PROMPT_TEMPLATE = """
@@ -78,7 +179,7 @@ query about a CSV file into a single, correct, and efficient 'xsv' command.
 </purpose>
 
 <instructions>
-1.  Analyze the user's query and the provided CSV file path.
+1.  Analyze the user's query, the provided CSV file path, and the pre-detected delimiter.
 2.  Determine the most appropriate 'xsv' subcommand and options to fulfill the query.
 3.  Construct the complete 'xsv' command string.
 4.  Ensure the command is syntactically correct and includes the file path.
@@ -87,7 +188,12 @@ query about a CSV file into a single, correct, and efficient 'xsv' command.
 7.  If the user query is ambiguous or cannot be translated into a single 'xsv' command,
     return an empty string or a brief message indicating the limitation.
 8.  Assume the 'xsv' command is available in the environment.
-9.  If the user specifies a delimiter other than comma, use the `-d` flag.
+9.  The script has pre-detected the delimiter for the input file as: '{detected_delimiter}'.
+    You MUST use this delimiter in your 'xsv' command by including the `-d "{detected_delimiter}"` option
+    if the detected delimiter is NOT a comma (e.g., for tab, semicolon, pipe).
+    For example, if detected_delimiter is a tab character, use `xsv ... -d "\t" ...`.
+    If the user's query *explicitly* specifies a different delimiter, prioritize the user's specification
+    and use that delimiter with the -d flag. Otherwise, rely on the pre-detected one.
 10. If the user asks for output formatting (e.g., JSON, pretty table), use appropriate
     xsv subcommands or combinations (e.g., `xsv search ... | xsv json`).
 </instructions>
@@ -96,26 +202,36 @@ query about a CSV file into a single, correct, and efficient 'xsv' command.
 
 <csv_file_path>{csv_file_path}</csv_file_path>
 
+<detected_delimiter_info>
+The file's delimiter has been pre-detected as: '{detected_delimiter}'.
+If this is not a comma, ensure you use the -d option (e.g., -d "\t" for tab, -d ";" for semicolon).
+</detected_delimiter_info>
+
 <examples>
 User Query: show first 10 rows
 CSV File Path: data.csv
+Detected Delimiter: ','
 xsv command: xsv slice -n 1 -u 10 data.csv
 
-User Query: count rows
-CSV File Path: data.csv
-xsv command: xsv count data.csv
+User Query: count rows in tab separated file
+CSV File Path: data.tsv
+Detected Delimiter: '\t'
+xsv command: xsv count -d "\t" data.tsv
 
-User Query: list columns
-CSV File Path: data.csv
-xsv command: xsv headers data.csv
+User Query: list columns from semicolon file
+CSV File Path: stats.scsv
+Detected Delimiter: ';'
+xsv command: xsv headers -d ";" stats.scsv
 
 User Query: filter rows where age > 30 and select name, email
 CSV File Path: users.csv
+Detected Delimiter: ','
 xsv command: xsv search -s age -p '^([3-9]\d|\d{{3,}})$' users.csv | xsv select name,email
 
-User Query: find rows with "error" in any column
-CSV File Path: log.tsv
-xsv command: xsv search "error" log.tsv -d "\t"
+User Query: find rows with "error" in any column (file is pipe-delimited)
+CSV File Path: log.psv
+Detected Delimiter: '|'
+xsv command: xsv search "error" log.psv -d "|"
 </examples>
 
 Your xsv command:
@@ -305,7 +421,7 @@ def call_google_llm(prompt: str, api_key: str, model_name: str) -> Tuple[Optiona
 
 # --- XSV Command Generation ---
 
-def get_xsv_command_from_ai(user_query: str, csv_file_path: str, llm_provider: str, api_key: str, model_name: str) -> Optional[str]:
+def get_xsv_command_from_ai(user_query: str, csv_file_path: str, llm_provider: str, api_key: str, model_name: str, detected_delimiter: str) -> Optional[str]:
     """
     Generates an xsv command from a user query using an LLM.
 
@@ -315,6 +431,7 @@ def get_xsv_command_from_ai(user_query: str, csv_file_path: str, llm_provider: s
         llm_provider: The LLM provider to use ('anthropic', 'openai', 'google').
         api_key: The API key for the chosen provider.
         model_name: The specific model name to use.
+        detected_delimiter: The delimiter detected by the script.
 
     Returns:
         The generated xsv command string, or None if generation failed.
@@ -323,12 +440,13 @@ def get_xsv_command_from_ai(user_query: str, csv_file_path: str, llm_provider: s
 
     console.log(
         f"Attempting to generate xsv command using {llm_provider}/{model_name} "
-        f"for query: '{user_query}' on file: '{csv_file_path}'"
+        f"for query: '{user_query}' on file: '{csv_file_path}' with detected delimiter: '{repr(detected_delimiter)}'"
     )
 
     prompt = XSV_COMMAND_GENERATION_PROMPT_TEMPLATE.format(
         user_query=user_query,
-        csv_file_path=csv_file_path
+        csv_file_path=csv_file_path,
+        detected_delimiter=detected_delimiter
     )
 
     response_text = None
@@ -379,13 +497,14 @@ def run_xsv_analyzer_agent(
     llm_provider: str,
     api_key: str,
     model_name: str,
-    output_file_path: Optional[str] = None
+    output_file_path: Optional[str] = None,
+    detected_delimiter: str = ',' # Added detected_delimiter
 ) -> Tuple[Optional[str], int, int]:
     """
     Main logic function for the XSV Analyzer Agent.
 
     Orchestrates the process of:
-    1. Getting an xsv command from an LLM based on user query.
+    1. Getting an xsv command from an LLM based on user query and detected delimiter.
     2. Optionally appending output redirection if an output file is specified.
     3. Executing the xsv command.
     4. Returning the result or error, along with token counts.
@@ -394,11 +513,11 @@ def run_xsv_analyzer_agent(
 
     console.log(
         f"Starting XSV Analyzer Agent for query: '{user_query}' "
-        f"on file: '{csv_file_path}'"
+        f"on file: '{csv_file_path}' (Delimiter for LLM: '{repr(detected_delimiter)}')"
     )
 
     generated_xsv_command = get_xsv_command_from_ai(
-        user_query, csv_file_path, llm_provider, api_key, model_name
+        user_query, csv_file_path, llm_provider, api_key, model_name, detected_delimiter
     )
 
     if not generated_xsv_command:
@@ -572,24 +691,45 @@ Other Prerequisites:
     
     console.log(f"Using LLM Provider: {args.llm_provider}, Model: {model_name_to_use}")
 
-    # Reset global token counters for this run, as main() is the entry point for a single execution.
-    # This ensures that if the script is imported and functions called multiple times,
-    # the main CLI execution path has its own clean token count.
+    # Ensure file is UTF-8 and get the path to process
+    path_to_process, original_encoding, was_converted = ensure_utf8_file(args.csv_file)
+
+    if original_encoding is None and not os.path.exists(path_to_process): # Check if ensure_utf8_file indicated a critical error
+        console.print(Panel(f"Critical error: Could not read or process input file '{args.csv_file}'. Exiting.", title="[bold red]File Processing Error[/bold red]", expand=False))
+        sys.exit(1)
+    
+    if was_converted:
+        console.log(f"Original file '{args.csv_file}' (encoding: {original_encoding}) was converted to UTF-8: '{path_to_process}'")
+    else:
+        console.log(f"Processing file '{path_to_process}' (original encoding: {original_encoding or 'assumed utf-8/binary'})")
+
+    # Detect delimiter from the (now guaranteed UTF-8) file
+    detected_delimiter = detect_delimiter(path_to_process)
+    console.log(f"Delimiter for xsv command generation on '{path_to_process}': '{repr(detected_delimiter)}'")
+
+    # Reset global token counters for this run
     global TOTAL_INPUT_TOKENS, TOTAL_OUTPUT_TOKENS
     TOTAL_INPUT_TOKENS = 0
     TOTAL_OUTPUT_TOKENS = 0
     
-    # Call run_xsv_analyzer_agent
-    # The run_xsv_analyzer_agent function returns token counts, but these are already accumulated globally.
-    # We pass them to display_token_usage for clarity, though display_token_usage will use the globals.
+    # Call run_xsv_analyzer_agent with the path_to_process
     _result_output, current_run_input_tokens, current_run_output_tokens = run_xsv_analyzer_agent(
         user_query=args.query,
-        csv_file_path=args.csv_file,
+        csv_file_path=path_to_process, # Use the UTF-8 version
         llm_provider=args.llm_provider,
         api_key=api_key,
         model_name=model_name_to_use,
-        output_file_path=args.output_file
+        output_file_path=args.output_file,
+        detected_delimiter=detected_delimiter
     )
+
+    # Optional: Cleanup the .utf8.csv file if it was created
+    # if was_converted and path_to_process != args.csv_file:
+    #     try:
+    #         os.remove(path_to_process)
+    #         console.log(f"Cleaned up temporary UTF-8 file: {path_to_process}", style="dim")
+    #     except OSError as e:
+    #         console.log(f"Warning: Could not remove temporary UTF-8 file '{path_to_process}': {e}", style="yellow")
 
     # run_xsv_analyzer_agent handles printing of its own results/errors.
     # main's responsibility is to call display_token_usage, which uses the final global counts.
