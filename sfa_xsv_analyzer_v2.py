@@ -34,6 +34,7 @@ import json
 import textwrap
 import csv
 import time # For retry logic
+import re # For stripping markdown from LLM responses
 from typing import Tuple, Optional, List, Dict, Any
 
 import litellm
@@ -47,7 +48,8 @@ from rich import print as rprint # For pretty-printing complex objects
 console = Console()
 
 # --- Constants ---
-DEFAULT_MODEL_LITELLM = "gpt-4o-mini" # Target for initial development
+#DEFAULT_MODEL_LITELLM = "gpt-4o-mini" # Target for initial development
+DEFAULT_MODEL_LITELLM = "anthropic/claude-3-sonnet-20240229" # Target for initial development
 DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS = 4000 # Default if AI doesn't specify
 MAX_XSV_OUTPUT_CHARS_LIMIT = 10000     # Absolute maximum truncation limit
 XSV_TRUNCATION_MESSAGE = "... [Output truncated]"
@@ -473,9 +475,11 @@ def run_xsv_analyzer_agent_v2(
 
     Instructions:
     1. Analyze the user's query, the file context, and the delimiter.
-    2. If the main `xsv -h` (provided below) is not enough, use the `get_xsv_subcommand_help` tool to get more details.
+    2. The main `xsv -h` output (provided below) gives a general overview. For subcommands that involve specific syntax for arguments (e.g., 'search' with a regex pattern, 'select' with column names, 'slice' with record ranges), you SHOULD use the `get_xsv_subcommand_help` tool to get precise usage details for that subcommand *before* constructing the final xsv command. This will help avoid errors from incorrect flags or argument order. Only skip this if the main help is unusually detailed for that specific subcommand or you have high certainty from prior, verified examples.
     3. Once you have sufficient information, construct your response.
-    4. Your final response (when not using a tool) MUST be a JSON object containing:
+    4. Your final response (when not using a tool) MUST be a raw JSON object (e.g., starting with `{{` and ending with `}}`).
+       Do NOT wrap the JSON in markdown code fences (e.g., ```json ... ```).
+       The JSON object must contain:
        - "xsv_command": (string) The complete 'xsv' command string. This command MUST include the actual file path: '{processed_file_path}'.
        - "preferred_output_truncation_length": (integer, optional) Your suggested character limit for the output of this command.
          If omitted, {DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS} will be used. Must be between 100 and {MAX_XSV_OUTPUT_CHARS_LIMIT}.
@@ -598,7 +602,18 @@ def run_xsv_analyzer_agent_v2(
                 continue
 
             try:
-                parsed_llm_response = json.loads(llm_content_str)
+                # Attempt to strip markdown fences if present
+                content_to_parse = llm_content_str.strip()
+                # Common patterns: ```json ... ``` or ``` ... ```
+                # Regex to capture content within optional json markdown fences
+                match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", content_to_parse, re.DOTALL | re.IGNORECASE)
+                if match:
+                    content_to_parse = match.group(1).strip()
+                # Fallback for simple triple backticks if regex didn't catch it or if it's just ```...```
+                elif content_to_parse.startswith("```") and content_to_parse.endswith("```"):
+                    content_to_parse = content_to_parse[3:-3].strip()
+                
+                parsed_llm_response = json.loads(content_to_parse) # Use the cleaned string
                 
                 if "error" in parsed_llm_response:
                     error_message = parsed_llm_response["error"]
@@ -634,7 +649,7 @@ def run_xsv_analyzer_agent_v2(
                     f"LLM response was not valid JSON. Content:\n{llm_content_str}",
                     title="[bold red]LLM Response Format Error[/bold red]", expand=False
                 ))
-                messages.append({"role": "user", "content": "Your response was not in the expected JSON format. Please provide the xsv command as a JSON object with 'xsv_command' and optionally 'preferred_output_truncation_length', or an 'error' field."})
+                messages.append({"role": "user", "content": "Your response was not in the expected JSON format. It might have been wrapped in markdown (e.g., ```json ... ```). Please provide only the raw JSON object itself, starting with { and ending with }, containing 'xsv_command' or 'error'."})
                 continue
 
             except ValueError as ve:
