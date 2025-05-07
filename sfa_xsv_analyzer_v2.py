@@ -14,9 +14,11 @@ This agent leverages Large Language Models (LLMs) via litellm to analyze
 CSV (and other delimiter-separated value) files using the 'xsv' command-line tool.
 It takes a natural language query, incorporates general xsv help, allows the LLM
 to request specific subcommand help using tool-calling, translates the query into
-an appropriate 'xsv' command, executes it, and returns the result.
+an appropriate 'xsv' command, executes it, and provides a synthesized answer.
 
-Based on the plan: ai_docs/plans/PLAN_sfa_xsv_analyzer_v2.md
+Based on the plans:
+- ai_docs/plans/PLAN_sfa_xsv_analyzer_v2.md
+- ai_docs/plans/PLAN_sfa_xsv_analyzer_v2_answer_synthesis.md
 
 Example CLI Usage:
   uv run sfa_xsv_analyzer_v2.py "show first 5 rows" -f data.csv
@@ -51,7 +53,7 @@ XSV_TRUNCATION_MESSAGE = "... [Output truncated]"
 # API call settings (can be refined or use litellm's defaults)
 API_MAX_RETRIES = 3 # For litellm calls, litellm has its own retry logic too.
 API_RETRY_WAIT = 5  # seconds
-MAX_INTERACTION_TURNS = 5 # Max LLM interactions (tool calls) to prevent loops
+DEFAULT_MAX_INTERACTION_TURNS = 15 # Default max LLM interactions (tool calls) to prevent loops
 
 # Token tracking (global for simplicity in this SFA)
 TOTAL_INPUT_TOKENS = 0
@@ -291,13 +293,100 @@ def execute_xsv_command(xsv_command_str: str) -> Tuple[bool, str, str]:
         console.log(stderr_str, style="bold red")
         return False, "", stderr_str
 
+# --- Answer Synthesis Function ---
+def synthesize_answer_from_xsv_output(
+    user_query: str,
+    xsv_output_data: str,
+    model_name: str,
+    original_file_name: str
+) -> Tuple[Optional[str], int, int]:
+    """
+    Uses an LLM to synthesize a direct, human-readable answer to the user's query
+    based on the raw output from the xsv command.
+    
+    Args:
+        user_query: The original natural language question from the user.
+        xsv_output_data: The raw string output from the executed xsv command.
+        model_name: The LiteLLM model identifier (e.g., "gpt-4o-mini").
+        original_file_name: The base name of the CSV file being queried (for context).
+        
+    Returns:
+        A tuple containing:
+        - The synthesized answer as a string, or None if synthesis failed.
+        - The number of input tokens used for this LLM call.
+        - The number of output tokens used for this LLM call.
+    """
+    console.log(f"Synthesizing answer from xsv output using model: {model_name}")
+    
+    # Check if output is empty
+    if not xsv_output_data or xsv_output_data.strip() == "":
+        console.log("XSV output is empty, returning a simple 'no data' response.")
+        return "No data was returned by the xsv command. This likely means no matching data was found.", 0, 0
+    
+    # Check if output is truncated
+    is_truncated = XSV_TRUNCATION_MESSAGE in xsv_output_data
+    truncation_note = f"\nNote that the xsv output was truncated at {XSV_OUTPUT_MAX_CHARS} characters." if is_truncated else ""
+    
+    # Construct system prompt for answer synthesis
+    system_prompt = textwrap.dedent(f"""
+    You are an analytical assistant that provides direct, concise answers to questions about CSV data.
+    
+    Your task is to analyze the output from an 'xsv' command and provide a clear, direct answer to the user's original query.
+    
+    Guidelines:
+    1. Focus ONLY on the data provided in the xsv output - do not make assumptions beyond what's shown.
+    2. Provide a direct answer to the user's query based solely on the xsv output.
+    3. If the query was "is X in the list?" and rows containing X are present in the output, confirm this clearly.
+    4. If the query was "is X in the list?" and no rows containing X are in the output, state this clearly.
+    5. If the xsv output appears to be truncated, acknowledge this limitation in your answer.
+    6. Keep your answer concise but complete - typically 1-3 sentences is sufficient.
+    7. Do not include the raw xsv output in your answer.
+    8. Do not explain the xsv command that was used.
+    
+    Original user query: "{user_query}"
+    CSV file being analyzed: "{original_file_name}"
+    {truncation_note}
+    """).strip()
+    
+    try:
+        # Make a single LLM call for answer synthesis (no tools needed)
+        response = litellm.completion(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"XSV command output:\n\n{xsv_output_data}"}
+            ],
+            max_tokens=300,
+            temperature=0.1
+        )
+        
+        # Extract answer and token usage
+        synthesized_answer = response.choices[0].message.content.strip()
+        input_tokens = response.usage.prompt_tokens or 0
+        output_tokens = response.usage.completion_tokens or 0
+        
+        console.log(f"Answer synthesis successful. Input tokens: {input_tokens}, Output tokens: {output_tokens}")
+        return synthesized_answer, input_tokens, output_tokens
+        
+    except litellm.exceptions.APIError as e:
+        console.print(Panel(f"LiteLLM API Error during answer synthesis: {e}",
+                           title="[bold red]Answer Synthesis Error[/bold red]",
+                           expand=False))
+        return None, 0, 0
+    except Exception as e:
+        console.print(Panel(f"Unexpected error during answer synthesis: {e}",
+                           title="[bold red]Answer Synthesis Error[/bold red]",
+                           expand=False))
+        return None, 0, 0
+
 # --- Main Agent Logic ---
 def run_xsv_analyzer_agent_v2(
     user_query: str,
     csv_file_path: str,
     model_name: str,
     output_file_path: Optional[str] = None,
-    user_specified_delimiter: Optional[str] = None
+    user_specified_delimiter: Optional[str] = None,
+    max_interaction_turns: int = DEFAULT_MAX_INTERACTION_TURNS
 ):
     """
     Main logic for the XSV Analyzer Agent v2.
@@ -379,8 +468,8 @@ def run_xsv_analyzer_agent_v2(
     final_xsv_command = None
 
     # 5. Main Interaction Loop with litellm
-    for turn in range(MAX_INTERACTION_TURNS):
-        console.rule(f"[bold cyan]LLM Interaction Turn {turn + 1}/{MAX_INTERACTION_TURNS}[/bold cyan]")
+    for turn in range(max_interaction_turns):
+        console.rule(f"[bold cyan]LLM Interaction Turn {turn + 1}/{max_interaction_turns}[/bold cyan]")
         # console.print(f"Sending messages to LLM ({model_name}):") # Can be verbose
         # for i, msg in enumerate(messages):
         #     # (Display logic omitted for brevity, was present in previous step)
@@ -464,17 +553,88 @@ def run_xsv_analyzer_agent_v2(
     console.rule("[bold blue]Executing Final XSV Command[/bold blue]")
     success, stdout, stderr = execute_xsv_command(final_xsv_command)
 
+    # Phase 3: Answer Synthesis (if xsv command was successful)
     if success:
-        console.print(Panel(stdout if stdout else "[No output]", title="[bold green]XSV Output[/bold green]", expand=True, border_style="green"))
-        if output_file_path:
-            try:
-                with open(output_file_path, 'w', encoding='utf-8') as f: f.write(stdout)
-                console.print(f"\n[green]Output saved to: {output_file_path}[/green]")
-            except Exception as e:
-                console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
+        # First, show the raw XSV output (but with a smaller panel)
+        console.print(Panel(stdout if stdout else "[No output]",
+                           title="[bold blue]Raw XSV Output[/bold blue]",
+                           expand=True,
+                           border_style="blue"))
+        
+        # If there's output to synthesize, proceed with answer synthesis
+        if stdout:
+            console.rule("[bold blue]Synthesizing Final Answer[/bold blue]")
+            
+            # Get the original file name for context
+            original_file_name = os.path.basename(processed_file_path)
+            
+            # Call the answer synthesis function
+            synthesized_answer, synthesis_input_tokens, synthesis_output_tokens = synthesize_answer_from_xsv_output(
+                user_query=user_query,
+                xsv_output_data=stdout,
+                model_name=model_name,
+                original_file_name=original_file_name
+            )
+            
+            # Update token counters
+            TOTAL_INPUT_TOKENS += synthesis_input_tokens
+            TOTAL_OUTPUT_TOKENS += synthesis_output_tokens
+            
+            # Display the synthesized answer if available
+            if synthesized_answer:
+                console.print(Panel(synthesized_answer,
+                                   title="[bold green]Synthesized Answer[/bold green]",
+                                   expand=True,
+                                   border_style="green"))
+                
+                # Save to output file if specified
+                if output_file_path:
+                    try:
+                        with open(output_file_path, 'w', encoding='utf-8') as f:
+                            # Include both the answer and the raw output
+                            f.write(f"SYNTHESIZED ANSWER:\n{synthesized_answer}\n\nRAW XSV OUTPUT:\n{stdout}")
+                        console.print(f"\n[green]Output saved to: {output_file_path}[/green]")
+                    except Exception as e:
+                        console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
+            else:
+                # Fallback if synthesis failed
+                console.print(Panel("Answer synthesis failed. Showing raw output only.",
+                                   title="[bold yellow]Synthesis Failed[/bold yellow]",
+                                   expand=False))
+                
+                # Save raw output to file if specified
+                if output_file_path:
+                    try:
+                        with open(output_file_path, 'w', encoding='utf-8') as f:
+                            f.write(stdout)
+                        console.print(f"\n[green]Raw output saved to: {output_file_path}[/green]")
+                    except Exception as e:
+                        console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
+        else:
+            # No output to synthesize
+            console.print(Panel("No output from xsv command to synthesize an answer from.",
+                               title="[bold yellow]No Data for Synthesis[/bold yellow]",
+                               expand=False))
+            
+            # Save empty result to file if specified
+            if output_file_path:
+                try:
+                    with open(output_file_path, 'w', encoding='utf-8') as f:
+                        f.write("No output from xsv command.")
+                    console.print(f"\n[green]Empty result saved to: {output_file_path}[/green]")
+                except Exception as e:
+                    console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
     else:
-        console.print(Panel(stderr if stderr else "[No error message]", title="[bold red]XSV Error[/bold red]", expand=True, border_style="red"))
-        if stdout: console.print(Panel(stdout, title="[bold yellow]XSV Output (despite error)[/bold yellow]", expand=True, border_style="yellow"))
+        # XSV command failed - show error and any partial output
+        console.print(Panel(stderr if stderr else "[No error message]",
+                           title="[bold red]XSV Error[/bold red]",
+                           expand=True,
+                           border_style="red"))
+        if stdout:
+            console.print(Panel(stdout,
+                               title="[bold yellow]XSV Output (despite error)[/bold yellow]",
+                               expand=True,
+                               border_style="yellow"))
 
     display_token_usage()
     console.rule("[bold blue]XSV Analyzer Agent v2 Finished[/bold blue]")
@@ -507,6 +667,13 @@ def main():
         help="Path to the CSV/TSV file to analyze."
     )
     parser.add_argument(
+        "-t", "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_INTERACTION_TURNS,
+        dest="max_interaction_turns",
+        help=f"Maximum number of LLM interaction turns (default: {DEFAULT_MAX_INTERACTION_TURNS})"
+    )
+    parser.add_argument(
         "-m", "--model",
         type=str,
         default=DEFAULT_MODEL_LITELLM,
@@ -517,7 +684,7 @@ def main():
         "-o", "--output-file",
         type=str,
         dest="output_file_path",
-        help="Optional: Path to save the stdout of the successful xsv command."
+        help="Optional: Path to save the synthesized answer and/or raw output of the successful xsv command."
     )
     parser.add_argument(
         "-d", "--delimiter",
@@ -548,6 +715,7 @@ def main():
         csv_file_path=args.csv_file_path,
         model_name=args.model_name,
         output_file_path=args.output_file_path,
+        max_interaction_turns=args.max_interaction_turns,
         user_specified_delimiter=args.user_specified_delimiter
     )
 
