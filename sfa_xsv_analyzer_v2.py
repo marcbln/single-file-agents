@@ -41,13 +41,15 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
+from rich import print as rprint # For pretty-printing complex objects
 
 # --- Initialize Rich Console ---
 console = Console()
 
 # --- Constants ---
 DEFAULT_MODEL_LITELLM = "gpt-4o-mini" # Target for initial development
-XSV_OUTPUT_MAX_CHARS = 4000
+DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS = 4000 # Default if AI doesn't specify
+MAX_XSV_OUTPUT_CHARS_LIMIT = 10000     # Absolute maximum truncation limit
 XSV_TRUNCATION_MESSAGE = "... [Output truncated]"
  
 # API call settings (can be refined or use litellm's defaults)
@@ -262,9 +264,32 @@ def detect_delimiter(file_path: str, num_lines_to_sample: int = 5, default_delim
         return default_delimiter
 
 # --- XSV Command Execution (from v1) ---
-def execute_xsv_command(xsv_command_str: str) -> Tuple[bool, str, str]:
-    """Executes a given xsv command string using subprocess."""
+def execute_xsv_command(xsv_command_str: str, requested_truncation_length: Optional[int] = None) -> Tuple[bool, str, str, Optional[int]]:
+    """
+    Executes a given xsv command string using subprocess.
+    Truncates output if it exceeds the determined truncation length.
+
+    Args:
+        xsv_command_str: The xsv command to execute.
+        requested_truncation_length: The desired truncation length suggested by the AI.
+
+    Returns:
+        A tuple: (success_flag, stdout_str, stderr_str, actual_truncation_limit_applied_if_any).
+        actual_truncation_limit_applied_if_any is the character limit used for truncation if truncation occurred, else None.
+    """
     console.log(f"Executing xsv command: '{xsv_command_str}'")
+
+    # Determine actual truncation character limit
+    if requested_truncation_length is not None:
+        # Use AI's requested length, but cap it at the absolute max and ensure it's positive
+        effective_truncation_chars = min(max(requested_truncation_length, 100), MAX_XSV_OUTPUT_CHARS_LIMIT) # Ensure at least 100 chars if specified
+        console.log(f"AI requested truncation at {requested_truncation_length} chars. Effective limit: {effective_truncation_chars} (Max: {MAX_XSV_OUTPUT_CHARS_LIMIT})")
+    else:
+        effective_truncation_chars = DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS
+        console.log(f"No specific truncation length requested by AI. Using default: {effective_truncation_chars} chars.")
+
+    actual_truncation_applied_at: Optional[int] = None
+
     try:
         process = subprocess.run(
             xsv_command_str, shell=True, capture_output=True, text=True, check=False
@@ -272,33 +297,36 @@ def execute_xsv_command(xsv_command_str: str) -> Tuple[bool, str, str]:
         stdout_str = process.stdout.strip() if process.stdout else ""
         stderr_str = process.stderr.strip() if process.stderr else ""
 
-        if process.returncode == 0 and stdout_str and len(stdout_str) > XSV_OUTPUT_MAX_CHARS:
-            cutoff_point = XSV_OUTPUT_MAX_CHARS - len(XSV_TRUNCATION_MESSAGE)
-            if cutoff_point < 0: # Should not happen with reasonable XSV_OUTPUT_MAX_CHARS
+        if process.returncode == 0 and stdout_str and len(stdout_str) > effective_truncation_chars:
+            cutoff_point = effective_truncation_chars - len(XSV_TRUNCATION_MESSAGE)
+            if cutoff_point < 0: # Should not happen with reasonable limits
                 cutoff_point = 0
             stdout_str = stdout_str[:cutoff_point] + XSV_TRUNCATION_MESSAGE
-            console.log(f"xsv command output truncated to {XSV_OUTPUT_MAX_CHARS} chars.")
+            actual_truncation_applied_at = effective_truncation_chars
+            console.log(f"xsv command output truncated to {effective_truncation_chars} chars.")
 
         if process.returncode != 0:
             console.log(f"xsv command failed (code {process.returncode}). Stderr: {stderr_str or '(empty)'}")
-            return False, stdout_str, stderr_str
+            return False, stdout_str, stderr_str, actual_truncation_applied_at # Still return stdout in case it has partial info
+        
         console.log("xsv command executed successfully.")
-        return True, stdout_str, stderr_str
+        return True, stdout_str, stderr_str, actual_truncation_applied_at
     except FileNotFoundError:
         stderr_str = "Error: 'xsv' command not found. Ensure it's installed and in PATH."
         console.log(stderr_str, style="bold red")
-        return False, "", stderr_str
+        return False, "", stderr_str, None
     except Exception as e:
         stderr_str = f"Unexpected error executing xsv command '{xsv_command_str}': {type(e).__name__}: {e}"
         console.log(stderr_str, style="bold red")
-        return False, "", stderr_str
+        return False, "", stderr_str, None
 
 # --- Answer Synthesis Function ---
 def synthesize_answer_from_xsv_output(
     user_query: str,
     xsv_output_data: str,
     model_name: str,
-    original_file_name: str
+    original_file_name: str,
+    actual_truncation_limit: Optional[int] # New parameter
 ) -> Tuple[Optional[str], int, int]:
     """
     Uses an LLM to synthesize a direct, human-readable answer to the user's query
@@ -309,6 +337,7 @@ def synthesize_answer_from_xsv_output(
         xsv_output_data: The raw string output from the executed xsv command.
         model_name: The LiteLLM model identifier (e.g., "gpt-4o-mini").
         original_file_name: The base name of the CSV file being queried (for context).
+        actual_truncation_limit: The character limit at which truncation occurred, if any.
         
     Returns:
         A tuple containing:
@@ -318,16 +347,14 @@ def synthesize_answer_from_xsv_output(
     """
     console.log(f"Synthesizing answer from xsv output using model: {model_name}")
     
-    # Check if output is empty
     if not xsv_output_data or xsv_output_data.strip() == "":
         console.log("XSV output is empty, returning a simple 'no data' response.")
         return "No data was returned by the xsv command. This likely means no matching data was found.", 0, 0
     
-    # Check if output is truncated
-    is_truncated = XSV_TRUNCATION_MESSAGE in xsv_output_data
-    truncation_note = f"\nNote that the xsv output was truncated at {XSV_OUTPUT_MAX_CHARS} characters." if is_truncated else ""
+    truncation_note = ""
+    if actual_truncation_limit is not None and XSV_TRUNCATION_MESSAGE in xsv_output_data:
+        truncation_note = f"\nNote that the xsv output was truncated at {actual_truncation_limit} characters."
     
-    # Construct system prompt for answer synthesis
     system_prompt = textwrap.dedent(f"""
     You are an analytical assistant that provides direct, concise answers to questions about CSV data.
     
@@ -338,7 +365,7 @@ def synthesize_answer_from_xsv_output(
     2. Provide a direct answer to the user's query based solely on the xsv output.
     3. If the query was "is X in the list?" and rows containing X are present in the output, confirm this clearly.
     4. If the query was "is X in the list?" and no rows containing X are in the output, state this clearly.
-    5. If the xsv output appears to be truncated, acknowledge this limitation in your answer.
+    5. If the xsv output appears to be truncated (as indicated by "{XSV_TRUNCATION_MESSAGE}"), acknowledge this limitation in your answer, mentioning the character limit if provided.
     6. Keep your answer concise but complete - typically 1-3 sentences is sufficient.
     7. Do not include the raw xsv output in your answer.
     8. Do not explain the xsv command that was used.
@@ -434,22 +461,27 @@ def run_xsv_analyzer_agent_v2(
     Tool Available:
     - `get_xsv_subcommand_help`: Use this tool if you need detailed help for a specific xsv subcommand
       (e.g., 'stats', 'slice', 'search') to understand its options better.
-      The main `xsv -h` output below provides an overview, but this tool gives specifics.
+
+    Output Truncation:
+    - The output from any executed 'xsv' command might be truncated.
+    - The absolute maximum output length is {MAX_XSV_OUTPUT_CHARS_LIMIT} characters.
+    - The default truncation length is {DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS} characters.
+    - When truncated, the output will end with "{XSV_TRUNCATION_MESSAGE}".
+    - You can suggest a 'preferred_output_truncation_length' (integer) in your JSON response if you believe a specific
+      length (between 100 and {MAX_XSV_OUTPUT_CHARS_LIMIT}) is more appropriate for the command you are generating.
+      This is useful if you anticipate very long output and want to control it, or if you need slightly more than the default.
 
     Instructions:
     1. Analyze the user's query, the file context, and the delimiter.
     2. If the main `xsv -h` (provided below) is not enough, use the `get_xsv_subcommand_help` tool to get more details.
-    3. Once you have sufficient information, construct the complete 'xsv' command string.
-    4. The command MUST include the actual file path: '{processed_file_path}'. Do not use placeholders like 'data.csv'.
-    5. Respond ONLY with the raw 'xsv' command string when you are ready to provide it. No explanations or other text.
-    6. If the query is ambiguous or cannot be translated into a single 'xsv' command even after using tools,
-       respond with a brief message starting with "ERROR:" explaining the issue.
-    7. IMPORTANT: The output from any executed 'xsv' command will be truncated if it exceeds {XSV_OUTPUT_MAX_CHARS} characters.
-       When truncated, the output will end with "{XSV_TRUNCATION_MESSAGE}".
-       Be mindful of this when constructing commands, especially for operations that might produce very large outputs
-       (e.g., viewing entire large files). Use the `get_xsv_subcommand_help` tool to explore commands or options
-       that might provide more summarized or targeted information if a full dump is likely to be truncated.
- 
+    3. Once you have sufficient information, construct your response.
+    4. Your final response (when not using a tool) MUST be a JSON object containing:
+       - "xsv_command": (string) The complete 'xsv' command string. This command MUST include the actual file path: '{processed_file_path}'.
+       - "preferred_output_truncation_length": (integer, optional) Your suggested character limit for the output of this command.
+         If omitted, {DEFAULT_XSV_OUTPUT_TRUNCATION_CHARS} will be used. Must be between 100 and {MAX_XSV_OUTPUT_CHARS_LIMIT}.
+    5. If the query is ambiguous or cannot be translated into a single 'xsv' command even after using tools,
+       respond with a JSON object: {{"error": "Your explanation here"}}.
+    
     Main `xsv -h` Output:
     ---
     {main_xsv_help}
@@ -465,7 +497,8 @@ def run_xsv_analyzer_agent_v2(
     )
     messages.append({"role": "user", "content": initial_user_content})
 
-    final_xsv_command = None
+    final_xsv_command_str = None
+    preferred_truncation: Optional[int] = None # Variable to store AI's preference
 
     # 5. Main Interaction Loop with litellm
     for turn in range(max_interaction_turns):
@@ -475,13 +508,22 @@ def run_xsv_analyzer_agent_v2(
         #     # (Display logic omitted for brevity, was present in previous step)
 
         try:
+            # --- LOG 1: MESSAGES TO LLM ---
+            console.log("[bold yellow] --- MESSAGES TO LLM --- [/bold yellow]")
+            try:
+                console.log(json.dumps(messages, indent=2, ensure_ascii=False))
+            except TypeError:
+                rprint(messages)
+            console.log("[bold yellow] ----------------------- [/bold yellow]")
+            # --- END LOG 1 ---
+
             response = litellm.completion(
                 model=model_name,
                 messages=messages,
                 tools=[TOOL_GET_XSV_SUBCOMMAND_HELP],
                 tool_choice="auto", 
-                max_tokens=300, 
-                temperature=0.1 
+                max_tokens=400, # Increased slightly for JSON
+                temperature=0.1
             )
             
             current_input_tokens = response.usage.prompt_tokens or 0
@@ -491,7 +533,26 @@ def run_xsv_analyzer_agent_v2(
             console.log(f"LLM call successful. Input tokens: {current_input_tokens}, Output tokens: {current_output_tokens}")
 
             response_message = response.choices[0].message
-            messages.append(response_message.model_dump(exclude_none=True)) 
+
+            # --- LOG 2: RESPONSE FROM LLM ---
+            console.log("[bold yellow] --- RESPONSE FROM LLM --- [/bold yellow]")
+            # Log the raw content string for easier debugging of JSON issues
+            raw_content_for_log = response_message.content if response_message.content else ""
+            # Use model_dump for the entire message object if it's a Pydantic model, otherwise handle dict
+            loggable_response_message = response_message.model_dump(exclude_none=True) if hasattr(response_message, 'model_dump') else response_message
+            
+            # Ensure content is part of the loggable structure if it was a simple string before
+            if isinstance(loggable_response_message, dict) and 'content' not in loggable_response_message and raw_content_for_log:
+                 loggable_response_message['content'] = raw_content_for_log
+
+            try:
+                console.log(json.dumps(loggable_response_message, indent=2, ensure_ascii=False))
+            except TypeError:
+                rprint(loggable_response_message)
+            console.log("[bold yellow] ------------------------- [/bold yellow]")
+            # --- END LOG 2 ---
+
+            messages.append(loggable_response_message)
 
             if response_message.tool_calls:
                 console.log("LLM requested tool call(s):")
@@ -510,131 +571,178 @@ def run_xsv_analyzer_agent_v2(
                                 tool_response_content = "Error: 'subcommand_name' not provided in tool call arguments."
                         except json.JSONDecodeError:
                             tool_response_content = f"Error: Invalid JSON in tool call arguments: {function_args_str}"
+                        except Exception as e: # Catch more general errors during tool execution
+                            tool_response_content = f"Error executing tool '{function_name}': {e}"
                         
                         messages.append({
-                            "tool_call_id": tool_call.id,
-                            "role": "tool",
-                            "name": function_name,
-                            "content": tool_response_content,
+                            "tool_call_id": tool_call.id, "role": "tool",
+                            "name": function_name, "content": tool_response_content,
                         })
-                    else: # Unknown tool
+                        # --- LOG 3: TOOL RESPONSE ---
+                        console.log("[bold green] --- TOOL RESPONSE CONTENT --- [/bold green]")
+                        console.log(messages[-1]) # Log the appended tool message
+                        console.log("[bold green] --------------------------- [/bold green]")
+                        # --- END LOG 3 ---
+                    else:
                         messages.append({
                             "tool_call_id": tool_call.id, "role": "tool", "name": function_name,
                             "content": f"Error: Tool '{function_name}' is not available.",
                         })
-                continue 
+                continue
             
-            final_content = response_message.content
-            if isinstance(final_content, str):
-                final_content = final_content.strip()
-                if final_content.startswith("ERROR:"):
-                    console.print(Panel(final_content, title="[bold red]LLM Error[/bold red]", expand=False))
-                    return 
-                elif "xsv" in final_content and processed_file_path in final_content: 
-                    final_xsv_command = final_content
-                    console.log(f"LLM provided final xsv command: '{final_xsv_command}'")
-                    break 
+            # No tool calls, expect JSON response with xsv_command or error
+            llm_content_str = response_message.content
+            if not llm_content_str or not isinstance(llm_content_str, str):
+                console.print(Panel("LLM provided non-string or empty content when command was expected.", title="[bold red]LLM Response Error[/bold red]", expand=False))
+                messages.append({"role": "user", "content": "Your response content was not a string or was empty. Please provide the xsv command as a JSON object or use a tool."})
+                continue
+
+            try:
+                parsed_llm_response = json.loads(llm_content_str)
+                
+                if "error" in parsed_llm_response:
+                    error_message = parsed_llm_response["error"]
+                    console.print(Panel(f"LLM indicated an error: {error_message}", title="[bold yellow]LLM Reported Issue[/bold yellow]", expand=False))
+                    console.rule("[bold red]Final Agent Output[/bold red]")
+                    console.print(f"Could not generate xsv command. Reason: {error_message}")
+                    return
+
+                if "xsv_command" in parsed_llm_response:
+                    final_xsv_command_str = parsed_llm_response["xsv_command"]
+                    if not isinstance(final_xsv_command_str, str) or not final_xsv_command_str.strip().startswith("xsv"):
+                        raise ValueError("LLM provided an invalid 'xsv_command' format or content (must be string starting with 'xsv').")
+                    
+                    final_xsv_command_str = final_xsv_command_str.strip() # Ensure it's stripped
+                    
+                    preferred_truncation = parsed_llm_response.get("preferred_output_truncation_length")
+                    if preferred_truncation is not None:
+                        if not isinstance(preferred_truncation, int):
+                            console.log(f"LLM provided non-integer preferred_output_truncation_length: {preferred_truncation}. Ignoring.", style="yellow")
+                            preferred_truncation = None
+                        elif not (100 <= preferred_truncation <= MAX_XSV_OUTPUT_CHARS_LIMIT):
+                             console.log(f"LLM provided out-of-bounds preferred_output_truncation_length: {preferred_truncation}. Will be clamped by execute_xsv_command.", style="yellow")
+                        else:
+                            console.log(f"LLM suggested preferred_output_truncation_length: {preferred_truncation}")
+                    
+                    console.log(f"LLM provided final xsv command: '{final_xsv_command_str}'")
+                    break # Exit loop, command received
                 else:
-                    console.log(f"LLM response not a command/error: '{final_content}'. Continuing.", style="yellow")
-            else:
-                console.log("LLM response content not string or empty.", style="yellow")
+                    raise ValueError("LLM JSON response missing 'xsv_command' or 'error' key.")
 
+            except json.JSONDecodeError:
+                console.print(Panel(
+                    f"LLM response was not valid JSON. Content:\n{llm_content_str}",
+                    title="[bold red]LLM Response Format Error[/bold red]", expand=False
+                ))
+                messages.append({"role": "user", "content": "Your response was not in the expected JSON format. Please provide the xsv command as a JSON object with 'xsv_command' and optionally 'preferred_output_truncation_length', or an 'error' field."})
+                continue
+
+            except ValueError as ve:
+                console.print(Panel(f"Error processing LLM JSON response: {ve}\nContent: {llm_content_str}", title="[bold red]LLM Response Error[/bold red]", expand=False))
+                messages.append({"role": "user", "content": f"There was an issue with your JSON response: {ve}. Please correct it."})
+                continue
+        
         except litellm.exceptions.APIError as e:
-            console.print(Panel(f"LiteLLM API Error (Turn {turn + 1}): {e}", title="[bold red]LiteLLM API Error[/bold red]", expand=False))
-            break
+            console.print(Panel(f"LiteLLM API Error (Turn {turn + 1}): {e}", title="[bold red]API Error[/bold red]", expand=False))
+            if turn < API_MAX_RETRIES -1 :
+                 console.log(f"Retrying LLM call in {API_RETRY_WAIT}s... (Attempt {turn + 2}/{API_MAX_RETRIES})")
+                 time.sleep(API_RETRY_WAIT)
+                 if messages and messages[-1].get("role") == "assistant": messages.pop()
+                 continue
+            console.print("API retries exhausted.")
+            return
         except Exception as e:
-            console.print(Panel(f"Unexpected LLM interaction error (Turn {turn + 1}): {e}", title="[bold red]LLM Interaction Error[/bold red]", expand=False))
-            break 
+            console.print(Panel(f"An unexpected error occurred during LLM interaction (Turn {turn + 1}): {e}", title="[bold red]Unexpected Error[/bold red]", expand=False))
+            return # Exit on other unexpected errors
 
-    if not final_xsv_command:
-        console.print(Panel("LLM did not provide a final xsv command after all turns or due to an error.", title="[bold orange]Agent Halted[/bold orange]", expand=False))
+    if not final_xsv_command_str:
+        console.print(Panel("Max interaction turns reached or loop exited, but no xsv command was generated.", title="[bold red]Interaction Limit Reached or Error[/bold red]", expand=False))
+        if messages: # Log last few messages if any exist
+            console.log("Last few messages in conversation:")
+            for msg in messages[-5:]: rprint(msg)
         return
 
-    console.rule("[bold blue]Executing Final XSV Command[/bold blue]")
-    success, stdout, stderr = execute_xsv_command(final_xsv_command)
+    # 6. Execute the final xsv command
+    console.rule("[bold green]Executing Final XSV Command[/bold green]")
+    console.print(f"Command: [cyan]{final_xsv_command_str}[/cyan]")
+    if preferred_truncation is not None:
+            clamped_truncation = min(max(preferred_truncation, 100), MAX_XSV_OUTPUT_CHARS_LIMIT)
+            console.print(f"Attempting to use AI-suggested truncation (clamped if necessary): {clamped_truncation} chars.")
 
-    # Phase 3: Answer Synthesis (if xsv command was successful)
+    success, stdout_data, stderr_data, actual_truncation_applied = execute_xsv_command(final_xsv_command_str, preferred_truncation)
+    
+    if stdout_data: # Always show stdout if present
+        console.print(Panel(Syntax(stdout_data, "bash", theme="monokai", line_numbers=True, word_wrap=True), title="[bold green]xsv stdout[/bold green]", expand=False, border_style="green"))
+    
+    if stderr_data: # Show stderr if present and either command failed or stderr has content
+        if not success or stderr_data.strip():
+             console.print(Panel(stderr_data, title="[bold red]xsv stderr[/bold red]", expand=False, border_style="red"))
+    
+    if not success and not stdout_data and not (stderr_data and stderr_data.strip()): # If failed, no stdout, no meaningful stderr
+         console.print(Panel("xsv command failed with no output to stdout or stderr.", title="[bold red]xsv Execution Failed[/bold red]", expand=False, border_style="red"))
+
+    # 7. Synthesize Answer
     if success:
-        # First, show the raw XSV output (but with a smaller panel)
-        console.print(Panel(stdout if stdout else "[No output]",
-                           title="[bold blue]Raw XSV Output[/bold blue]",
-                           expand=True,
-                           border_style="blue"))
-        
-        # If there's output to synthesize, proceed with answer synthesis
-        if stdout:
-            console.rule("[bold blue]Synthesizing Final Answer[/bold blue]")
-            
-            # Get the original file name for context
-            original_file_name = os.path.basename(processed_file_path)
-            
-            # Call the answer synthesis function
-            synthesized_answer, synthesis_input_tokens, synthesis_output_tokens = synthesize_answer_from_xsv_output(
-                user_query=user_query,
-                xsv_output_data=stdout,
-                model_name=model_name,
-                original_file_name=original_file_name
-            )
-            
-            # Update token counters
-            TOTAL_INPUT_TOKENS += synthesis_input_tokens
-            TOTAL_OUTPUT_TOKENS += synthesis_output_tokens
-            
-            # Display the synthesized answer if available
-            if synthesized_answer:
-                console.print(Panel(synthesized_answer,
-                                   title="[bold green]Synthesized Answer[/bold green]",
-                                   expand=True,
-                                   border_style="green"))
-                
-                # Save to output file if specified
-                if output_file_path:
-                    try:
-                        with open(output_file_path, 'w', encoding='utf-8') as f:
-                            # Include both the answer and the raw output
-                            f.write(f"SYNTHESIZED ANSWER:\n{synthesized_answer}\n\nRAW XSV OUTPUT:\n{stdout}")
-                        console.print(f"\n[green]Output saved to: {output_file_path}[/green]")
-                    except Exception as e:
-                        console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
-            else:
-                # Fallback if synthesis failed
-                console.print(Panel("Answer synthesis failed. Showing raw output only.",
-                                   title="[bold yellow]Synthesis Failed[/bold yellow]",
-                                   expand=False))
-                
-                # Save raw output to file if specified
-                if output_file_path:
-                    try:
-                        with open(output_file_path, 'w', encoding='utf-8') as f:
-                            f.write(stdout)
-                        console.print(f"\n[green]Raw output saved to: {output_file_path}[/green]")
-                    except Exception as e:
-                        console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
-        else:
-            # No output to synthesize
-            console.print(Panel("No output from xsv command to synthesize an answer from.",
-                               title="[bold yellow]No Data for Synthesis[/bold yellow]",
-                               expand=False))
-            
-            # Save empty result to file if specified
+        console.rule("[bold magenta]Synthesizing Answer[/bold magenta]")
+        synthesized_answer, synth_in_tokens, synth_out_tokens = synthesize_answer_from_xsv_output(
+            user_query,
+            stdout_data,
+            model_name,
+            os.path.basename(csv_file_path), # Use processed_file_path for consistency if needed, but basename is for display
+            actual_truncation_applied
+        )
+        TOTAL_INPUT_TOKENS += synth_in_tokens
+        TOTAL_OUTPUT_TOKENS += synth_out_tokens
+
+        if synthesized_answer:
+            console.rule("[bold blue]Final Synthesized Answer[/bold blue]")
+            console.print(Panel(synthesized_answer, title="Answer", expand=False))
             if output_file_path:
                 try:
                     with open(output_file_path, 'w', encoding='utf-8') as f:
-                        f.write("No output from xsv command.")
-                    console.print(f"\n[green]Empty result saved to: {output_file_path}[/green]")
+                        f.write(f"User Query: {user_query}\n")
+                        f.write(f"XSV Command: {final_xsv_command_str}\n")
+                        if preferred_truncation is not None or actual_truncation_applied is not None:
+                             f.write(f"AI Suggested Truncation: {preferred_truncation if preferred_truncation is not None else 'N/A'}\n")
+                             f.write(f"Actual Truncation Applied At: {actual_truncation_applied if actual_truncation_applied is not None else 'Not Truncated or Default'}\n")
+                        f.write(f"\nXSV Output:\n{stdout_data}\n\n") # stdout_data already contains truncation message if applied
+                        if stderr_data and stderr_data.strip(): # Only write stderr if it has content
+                            f.write(f"XSV Stderr:\n{stderr_data}\n\n")
+                        f.write(f"Synthesized Answer:\n{synthesized_answer}\n")
+                    console.log(f"Full interaction details saved to: {output_file_path}")
                 except Exception as e:
-                    console.print(f"\n[bold red]Error saving to '{output_file_path}': {e}[/bold red]")
-    else:
-        # XSV command failed - show error and any partial output
-        console.print(Panel(stderr if stderr else "[No error message]",
-                           title="[bold red]XSV Error[/bold red]",
-                           expand=True,
-                           border_style="red"))
-        if stdout:
-            console.print(Panel(stdout,
-                               title="[bold yellow]XSV Output (despite error)[/bold yellow]",
-                               expand=True,
-                               border_style="yellow"))
+                    console.log(f"Error writing to output file '{output_file_path}': {e}", style="red")
+        else: # Synthesize answer returned None or empty
+            console.print("[bold yellow]Could not synthesize an answer from the xsv output.[/bold yellow]")
+            if not stdout_data and not success:
+                pass # Error already handled by xsv execution block
+            elif not stdout_data:
+                console.print("[italic]The xsv command produced no output to synthesize from.[/italic]")
+                if output_file_path: # Still save what we have
+                    try:
+                        with open(output_file_path, 'w', encoding='utf-8') as f:
+                            f.write(f"User Query: {user_query}\n")
+                            f.write(f"XSV Command: {final_xsv_command_str}\n")
+                            f.write("XSV Output: No output produced.\n")
+                            if stderr_data and stderr_data.strip(): f.write(f"XSV Stderr:\n{stderr_data}\n")
+                            f.write("Synthesized Answer: Could not be generated (no xsv output).\n")
+                        console.log(f"Interaction details (no synthesis) saved to: {output_file_path}")
+                    except Exception as e:
+                        console.log(f"Error writing to output file '{output_file_path}': {e}", style="red")
+
+    else: # xsv command failed
+        console.print("[bold red]Skipping answer synthesis because the xsv command failed.[/bold red]")
+        if output_file_path: # Save error details
+            try:
+                with open(output_file_path, 'w', encoding='utf-8') as f:
+                    f.write(f"User Query: {user_query}\n")
+                    f.write(f"XSV Command Attempted: {final_xsv_command_str}\n")
+                    f.write("XSV Command Execution Failed.\n")
+                    if stdout_data: f.write(f"XSV stdout (partial/error):\n{stdout_data}\n")
+                    if stderr_data: f.write(f"XSV stderr:\n{stderr_data}\n")
+                console.log(f"Error details saved to: {output_file_path}")
+            except Exception as e:
+                console.log(f"Error writing error details to output file '{output_file_path}': {e}", style="red")
 
     display_token_usage()
     console.rule("[bold blue]XSV Analyzer Agent v2 Finished[/bold blue]")

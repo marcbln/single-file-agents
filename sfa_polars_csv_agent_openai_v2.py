@@ -3,7 +3,7 @@
 #   "openai>=1.63.0",
 #   "rich>=13.7.0",
 #   "pydantic>=2.0.0",
-#   "polars>=1.22.0",
+#   "polars-lts-cpu>=1.22.0",
 # ]
 # ///
 
