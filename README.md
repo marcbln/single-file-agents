@@ -3,10 +3,6 @@
 > 
 > Premise: #2: What's the best structural pattern for building Agents that can improve in capability as compute and intelligence increases?
 
-![Scale Your AI Coding Impact](images/scale-your-ai-coding-impact-with-devin-cursor-aider.png)
-
-![Single File Agents](images/single-file-agents-thumb.png)
-
 ## What is this?
 
 A collection of powerful single-file agents built on top of [uv](https://github.com/astral/uv) - the modern Python package installer and resolver. 
