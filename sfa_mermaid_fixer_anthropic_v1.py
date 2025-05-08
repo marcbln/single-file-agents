@@ -157,10 +157,11 @@ def validate_mermaid_code(code: str) -> Tuple[bool, str]:
             temp_file.write(code)
             temp_file_path = temp_file.name
 
-        # Determine the null output target based on OS
-        output_target = "NUL" if sys.platform == "win32" else "/dev/null"
+        # Create a temporary output file with valid extension
+        with tempfile.NamedTemporaryFile(mode='w', suffix=".svg", delete=False, encoding='utf-8') as temp_output:
+            output_target = temp_output.name
 
-        # Construct the mmdc command
+        # Construct the mmdc command with valid output file
         command = ["mmdc", "-i", temp_file_path, "-o", output_target, "--quiet"]
 
         # Execute the command
@@ -408,7 +409,7 @@ def main():
     # --- Output Results ---
     if fixed_code:
         console.print(Panel("✅ Final Fixed Code:", style="bold green", title_align="left"))
-        console.print(Syntax(fixed_code, "mermaid", theme="monokai", line_numbers=True))
+        console.print(Syntax(fixed_code, "mermaid", theme="monokai", line_numbers=False))
 
         if args.output:
             try:
