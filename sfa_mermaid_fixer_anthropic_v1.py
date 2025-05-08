@@ -290,7 +290,7 @@ def run_fixer_agent(initial_code: str, max_iterations: int, client: Anthropic) -
 
     for i in range(max_iterations):
         console.print(Panel(f"Iteration {i + 1}/{max_iterations}", style="bold blue", title="Iteration Progress"))
-        console.print(Panel(Syntax(current_code, "mermaid", theme="default", line_numbers=True, background_color="default"), title="Current Code", border_style="cyan"))
+        console.print(Panel(Syntax(current_code, "mermaid", theme="monokai", line_numbers=True), title="Current Code", border_style="cyan"))
 
         # Validate the current code
         is_valid, validation_output = validate_mermaid_code(current_code)
@@ -408,7 +408,7 @@ def main():
     # --- Output Results ---
     if fixed_code:
         console.print(Panel("✅ Final Fixed Code:", style="bold green", title_align="left"))
-        console.print(Syntax(fixed_code, "mermaid", theme="default", line_numbers=True, background_color="default"))
+        console.print(Syntax(fixed_code, "mermaid", theme="monokai", line_numbers=True))
 
         if args.output:
             try:
